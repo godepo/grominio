@@ -1,0 +1,15 @@
+with-expecter: True
+all: True
+dir: ./
+mockname: "Mock{{.InterfaceName}}"
+filename: "mock_{{.InterfaceName}}_test.go"
+outpkg: "grominio"
+packages:
+  github.com/godepo/grominio:
+    config:
+      all: False
+    interfaces:
+        DB:
+          config:
+        MinioContainer:
+          config:
