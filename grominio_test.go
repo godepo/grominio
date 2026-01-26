@@ -72,3 +72,26 @@ func TestMinioContainerRunner(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, res)
 }
+
+func TestHostedDSN(t *testing.T) {
+	t.Run("should be able to be broken", func(t *testing.T) {
+		t.Setenv("GROAT_I9N_MINIO_DSN", "\a'.xI")
+
+		type TestDeps struct{}
+
+		boot := New[TestDeps]()
+		_, err := boot(t.Context())
+		require.ErrorContains(t, err, "error parsing hosted DSN")
+	})
+
+	t.Run("should be able to be able", func(t *testing.T) {
+		t.Setenv("GROAT_I9N_MINIO_DSN", "http://user:password@127.0.0.1:80")
+
+		type TestDeps struct {
+		}
+
+		boot := New[TestDeps]()
+		_, err := boot(t.Context())
+		require.NoError(t, err)
+	})
+}
