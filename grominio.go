@@ -4,13 +4,14 @@ package grominio
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os"
 	"sync/atomic"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/godepo/groat/pkg/ctxgroup"
 
 	"github.com/godepo/groat/integration"
@@ -31,6 +32,8 @@ type (
 		containerImage string
 		runner         minioRunner
 		terminator     Terminator
+		hostedDSN      string
+		bucketPrefix   string
 	}
 
 	Terminator func(
@@ -47,11 +50,13 @@ type (
 	}
 
 	Container[T any] struct {
-		forks      *atomic.Int32
-		minio      MinioContainer
-		connString string
-		ctx        context.Context
-		cfg        config
+		forks        *atomic.Int32
+		userName     string
+		password     string
+		connString   string
+		ctx          context.Context
+		cfg          config
+		bucketPrefix string
 	}
 )
 type Option func(*config)
@@ -59,6 +64,12 @@ type Option func(*config)
 func WithTerminator(terminator Terminator) Option {
 	return func(o *config) {
 		o.terminator = terminator
+	}
+}
+
+func WithBucketPrefix(prefix string) Option {
+	return func(c *config) {
+		c.bucketPrefix = prefix
 	}
 }
 
@@ -91,27 +102,28 @@ func minioContainerRunner(
 	if err != nil {
 		return nil, err
 	}
+
 	return wrapMinioContainer{container: mc}, nil
 }
 
 func newContainer[T any](ctx context.Context,
-	mc MinioContainer,
 	cfg config,
-) (*Container[T], error) {
+	connString string,
+	userName string,
+	password string,
+) *Container[T] {
 	container := &Container[T]{
-		forks: &atomic.Int32{},
-		minio: mc,
-		ctx:   ctx,
-		cfg:   cfg,
+		forks:        &atomic.Int32{},
+		userName:     userName,
+		password:     password,
+		ctx:          ctx,
+		cfg:          cfg,
+		bucketPrefix: cfg.bucketPrefix,
 	}
 
-	connString, err := mc.ConnectionString(ctx)
-	if err != nil {
-		return nil, err
-	}
 	container.connString = connString
 
-	return container, nil
+	return container
 }
 
 func New[T any](all ...Option) integration.Bootstrap[T] {
@@ -125,28 +137,32 @@ func New[T any](all ...Option) integration.Bootstrap[T] {
 		opt(&cfg)
 	}
 
+	if env := os.Getenv("GROAT_I9N_MINIO_DSN"); env != "" {
+		cfg.hostedDSN = env
+	}
+
 	return bootstrapper[T](cfg)
 }
 
 func (c *Container[T]) Injector(t *testing.T, to T) T {
 	t.Helper()
 
-	bucket := fmt.Sprintf("bucket%d", c.forks.Add(1))
+	bucket := fmt.Sprintf("%s%d", c.bucketPrefix, c.forks.Add(1))
+	s3Config := aws.NewConfig()
 
-	s3Config := &aws.Config{
-		Credentials:      credentials.NewStaticCredentials(c.minio.UserName(), c.minio.Password(), ""),
-		Endpoint:         aws.String(c.connString),
-		Region:           aws.String("us-east-1"),
-		DisableSSL:       aws.Bool(true),
-		S3ForcePathStyle: aws.Bool(true),
-	}
+	s3Config.Credentials = credentials.NewStaticCredentialsProvider(
+		c.userName,
+		c.password,
+		"")
 
-	sess, err := session.NewSession(s3Config)
-	require.NoError(t, err)
+	s3Config.BaseEndpoint = aws.String("http://" + c.connString)
+	s3Config.Region = "us-east-1"
 
-	s3Client := s3.New(sess)
+	s3Client := s3.NewFromConfig(*s3Config, func(options *s3.Options) {
+		options.UsePathStyle = true
+	})
 
-	_, err = s3Client.CreateBucket(&s3.CreateBucketInput{
+	_, err := s3Client.CreateBucket(t.Context(), &s3.CreateBucketInput{
 		Bucket: aws.String(bucket),
 	})
 	require.NoError(t, err)
@@ -154,23 +170,44 @@ func (c *Container[T]) Injector(t *testing.T, to T) T {
 	to = generics.Injector(t, s3Client, to, "s3client")
 	to = generics.Injector(t, bucket, to, "s3bucketname")
 	to = generics.Injector(t, c.connString, to, "s3url")
+
 	return to
 }
 
 func bootstrapper[T any](cfg config) integration.Bootstrap[T] {
 	return func(ctx context.Context) (integration.Injector[T], error) {
-		mc, err := cfg.runner(ctx, cfg.containerImage)
-		if err != nil {
-			return nil, fmt.Errorf("error creating minio container: %w", err)
+		if cfg.hostedDSN == "" {
+			mc, err := cfg.runner(ctx, cfg.containerImage)
+			if err != nil {
+				return nil, fmt.Errorf("error creating minio container: %w", err)
+			}
+
+			ctxgroup.IncAt(ctx)
+
+			go cfg.terminator(ctx, mc.Terminate)()
+
+			connString, err := mc.ConnectionString(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			container := newContainer[T](ctx, cfg, connString, mc.UserName(), mc.Password())
+
+			return container.Injector, nil
 		}
 
-		ctxgroup.IncAt(ctx)
-
-		go cfg.terminator(ctx, mc.Terminate)()
-		container, err := newContainer[T](ctx, mc, cfg)
+		dsn, err := url.Parse(cfg.hostedDSN)
 		if err != nil {
-			return nil, fmt.Errorf("error creating minio container: %w", err)
+			return nil, fmt.Errorf("error parsing hosted DSN: %w", err)
 		}
+
+		var userName, password string
+		if dsn.User != nil {
+			userName = dsn.User.Username()
+			password, _ = dsn.User.Password()
+		}
+
+		container := newContainer[T](ctx, cfg, dsn.Hostname()+":"+dsn.Port(), userName, password)
 
 		return container.Injector, nil
 	}

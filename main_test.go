@@ -28,7 +28,10 @@ func TestMain(m *testing.M) {
 			})
 			return tcs
 		},
-		New[Deps](WithTerminator(containersync.Terminator)),
+		New[Deps](
+			WithTerminator(containersync.Terminator),
+			WithBucketPrefix("test-"),
+		),
 	)
 	os.Exit(suite.Go())
 }
